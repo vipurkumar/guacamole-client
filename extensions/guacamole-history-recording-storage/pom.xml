@@ -43,6 +43,19 @@
             <artifactId>guacamole-ext</artifactId>
         </dependency>
 
+        <!-- MinIO Java SDK for S3-compatible recording storage -->
+        <dependency>
+            <groupId>io.minio</groupId>
+            <artifactId>minio</artifactId>
+            <version>8.5.7</version>
+        </dependency>
+
+        <!-- SLF4J API for logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+
     </dependencies>
 
 </project>

@@ -20,8 +20,11 @@
 package org.apache.guacamole.history.user;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 import org.apache.guacamole.GuacamoleException;
+import org.apache.guacamole.environment.Environment;
+import org.apache.guacamole.environment.LocalEnvironment;
 import org.apache.guacamole.history.HistoryAuthenticationProvider;
 import org.apache.guacamole.history.connection.HistoryConnection;
 import org.apache.guacamole.history.connection.RecordedConnectionActivityRecordSet;
@@ -34,19 +37,29 @@ import org.apache.guacamole.net.auth.Directory;
 import org.apache.guacamole.net.auth.TokenInjectingUserContext;
 import org.apache.guacamole.net.auth.User;
 import org.apache.guacamole.net.auth.UserContext;
+import org.apache.guacamole.properties.StringGuacamoleProperty;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * UserContext implementation that automatically defines ActivityLogs for
- * files that relate to history entries.
+ * files that relate to history entries. When S3 storage is configured,
+ * connection tokens are injected so that guacd receives the S3 parameters
+ * needed to write recordings directly to S3.
  */
 public class HistoryUserContext extends TokenInjectingUserContext {
+
+    /**
+     * Logger for this class.
+     */
+    private static final Logger logger = LoggerFactory.getLogger(HistoryUserContext.class);
 
     /**
      * The name of the parameter token that contains the automatically-searched
      * history recording/log path.
      */
     private static final String HISTORY_PATH_TOKEN_NAME = "HISTORY_PATH";
-    
+
     /**
      * The current Guacamole user.
      */
@@ -80,10 +93,56 @@ public class HistoryUserContext extends TokenInjectingUserContext {
      *     If the relevant tokens cannot be generated.
      */
     private Map<String, String> getTokens() throws GuacamoleException {
-        return Collections.singletonMap(HISTORY_PATH_TOKEN_NAME,
+
+        Map<String, String> tokens = new HashMap<>();
+
+        // Always provide the history path token
+        tokens.put(HISTORY_PATH_TOKEN_NAME,
                 HistoryAuthenticationProvider.getRecordingSearchPath().getAbsolutePath());
+
+        // If S3 storage is enabled, inject S3 parameters as tokens so they
+        // can be used in connection parameters via ${HISTORY_RECORDING_S3_*}
+        if (HistoryAuthenticationProvider.isS3Enabled()) {
+            Environment environment = LocalEnvironment.getInstance();
+
+            String endpoint = environment.getProperty(
+                    new StringGuacamoleProperty() {
+                        @Override public String getName() { return "recording-s3-endpoint"; }
+                    });
+            String bucket = environment.getProperty(
+                    new StringGuacamoleProperty() {
+                        @Override public String getName() { return "recording-s3-bucket"; }
+                    });
+            String accessKey = environment.getProperty(
+                    new StringGuacamoleProperty() {
+                        @Override public String getName() { return "recording-s3-access-key"; }
+                    });
+            String secretKey = environment.getProperty(
+                    new StringGuacamoleProperty() {
+                        @Override public String getName() { return "recording-s3-secret-key"; }
+                    });
+            String region = environment.getProperty(
+                    new StringGuacamoleProperty() {
+                        @Override public String getName() { return "recording-s3-region"; }
+                    });
+
+            if (endpoint != null)
+                tokens.put("HISTORY_RECORDING_S3_ENDPOINT", endpoint);
+            if (bucket != null)
+                tokens.put("HISTORY_RECORDING_S3_BUCKET", bucket);
+            if (accessKey != null)
+                tokens.put("HISTORY_RECORDING_S3_ACCESS_KEY", accessKey);
+            if (secretKey != null)
+                tokens.put("HISTORY_RECORDING_S3_SECRET_KEY", secretKey);
+            if (region != null)
+                tokens.put("HISTORY_RECORDING_S3_REGION", region);
+
+            tokens.put("HISTORY_RECORDING_STORAGE_TYPE", "s3");
+        }
+
+        return tokens;
     }
-    
+
     @Override
     protected Map<String, String> getTokens(ConnectionGroup connectionGroup)
             throws GuacamoleException {
