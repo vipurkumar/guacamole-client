@@ -22,6 +22,7 @@ package org.apache.guacamole.history.connection;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.net.MalformedURLException;
@@ -40,12 +41,17 @@ import org.apache.guacamole.net.auth.ActivityLog;
 import org.apache.guacamole.net.auth.ConnectionRecord;
 import org.apache.guacamole.net.auth.DelegatingConnectionRecord;
 import org.apache.guacamole.net.auth.FileActivityLog;
+import io.minio.ListObjectsArgs;
+import io.minio.MinioClient;
+import io.minio.Result;
+import io.minio.messages.Item;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * ConnectionRecord implementation that automatically defines ActivityLogs for
- * files that relate to the wrapped record.
+ * files that relate to the wrapped record. Supports both local filesystem
+ * and S3-compatible storage.
  */
 public class HistoryConnectionRecord extends DelegatingConnectionRecord {
 
@@ -67,9 +73,20 @@ public class HistoryConnectionRecord extends DelegatingConnectionRecord {
     /**
      * The recording file associated with the wrapped connection record. This
      * may be a single file or a directory that may contain any number of
-     * relevant recordings.
+     * relevant recordings. Will be null if S3 storage is used or if no
+     * local recording exists.
      */
     private final File recording;
+
+    /**
+     * Whether S3 storage is enabled for recordings.
+     */
+    private final boolean useS3;
+
+    /**
+     * The UUID of the wrapped record, used for S3 object prefix lookup.
+     */
+    private final UUID recordUUID;
 
     /**
      * Returns the file or directory providing recording storage for the given
@@ -113,7 +130,13 @@ public class HistoryConnectionRecord extends DelegatingConnectionRecord {
      */
     public HistoryConnectionRecord(ConnectionRecord record) throws GuacamoleException {
         super(record);
-        this.recording = getRecordingFile(record);
+        this.useS3 = HistoryAuthenticationProvider.isS3Enabled();
+        this.recordUUID = record.getUUID();
+
+        if (useS3)
+            this.recording = null;
+        else
+            this.recording = getRecordingFile(record);
     }
 
     /**
@@ -305,10 +328,114 @@ public class HistoryConnectionRecord extends DelegatingConnectionRecord {
 
     }
 
+    /**
+     * Determines the ActivityLog type for an S3 object based on its key name.
+     *
+     * @param objectKey
+     *     The S3 object key.
+     *
+     * @return
+     *     The determined ActivityLog type, defaulting to
+     *     GUACAMOLE_SESSION_RECORDING.
+     */
+    private ActivityLog.Type getS3ObjectType(String objectKey) {
+        if (objectKey.endsWith(TIMING_FILE_SUFFIX))
+            return ActivityLog.Type.TYPESCRIPT_TIMING;
+
+        // Default to session recording for S3 objects
+        return ActivityLog.Type.GUACAMOLE_SESSION_RECORDING;
+    }
+
+    /**
+     * Adds S3-backed ActivityLog entries to the given map for all objects
+     * stored under the record's UUID prefix.
+     *
+     * @param logs
+     *     The map of logs to add S3 ActivityLog entries to.
+     */
+    private void addS3ActivityLogs(Map<String, ActivityLog> logs) {
+
+        if (recordUUID == null)
+            return;
+
+        try {
+            MinioClient client = HistoryAuthenticationProvider.getMinioClient();
+            String bucket = HistoryAuthenticationProvider.getS3Bucket();
+            String prefix = recordUUID.toString() + "/";
+
+            Iterable<Result<Item>> results = client.listObjects(
+                    ListObjectsArgs.builder()
+                            .bucket(bucket)
+                            .prefix(prefix)
+                            .recursive(true)
+                            .build());
+
+            for (Result<Item> result : results) {
+                Item item = result.get();
+                String objectKey = item.objectName();
+
+                ActivityLog.Type logType = getS3ObjectType(objectKey);
+
+                // Generate deterministic UUID from object key
+                byte[] keyBytes = objectKey.getBytes(StandardCharsets.UTF_8);
+                UUID objectUUID = UUID.nameUUIDFromBytes(ByteBuffer.allocate(16 + keyBytes.length)
+                        .putLong(UUID_NAMESPACE_URL.getMostSignificantBits())
+                        .putLong(UUID_NAMESPACE_URL.getLeastSignificantBits())
+                        .put(keyBytes)
+                        .array());
+
+                logs.put(objectUUID.toString(), new S3ActivityLog(
+                        logType,
+                        new TranslatableMessage("RECORDING_STORAGE.INFO_" + logType.name()),
+                        client, bucket, objectKey));
+            }
+
+            // Also check for a single object with just the UUID as key
+            // (no directory structure)
+            try {
+                io.minio.StatObjectArgs statArgs = io.minio.StatObjectArgs.builder()
+                        .bucket(bucket)
+                        .object(recordUUID.toString())
+                        .build();
+                client.statObject(statArgs);
+
+                // Object exists as a single file
+                byte[] keyBytes = recordUUID.toString().getBytes(StandardCharsets.UTF_8);
+                UUID objectUUID = UUID.nameUUIDFromBytes(ByteBuffer.allocate(16 + keyBytes.length)
+                        .putLong(UUID_NAMESPACE_URL.getMostSignificantBits())
+                        .putLong(UUID_NAMESPACE_URL.getLeastSignificantBits())
+                        .put(keyBytes)
+                        .array());
+
+                logs.put(objectUUID.toString(), new S3ActivityLog(
+                        ActivityLog.Type.GUACAMOLE_SESSION_RECORDING,
+                        new TranslatableMessage("RECORDING_STORAGE.INFO_GUACAMOLE_SESSION_RECORDING"),
+                        client, bucket, recordUUID.toString()));
+            }
+            catch (Exception e) {
+                // Object doesn't exist as a single file, which is fine
+                logger.debug("No single-object recording found for UUID {}", recordUUID);
+            }
+
+        }
+        catch (Exception e) {
+            logger.warn("Failed to list S3 recordings for record {}: {}",
+                    recordUUID, e.getMessage(), e);
+        }
+
+    }
+
     @Override
     public Map<String, ActivityLog> getLogs() {
 
-        // Do nothing if there are no associated logs
+        // If using S3 storage, look up recordings from S3
+        if (useS3) {
+            Map<String, ActivityLog> logs = new HashMap<>(super.getLogs());
+            addS3ActivityLogs(logs);
+            return logs;
+        }
+
+        // Do nothing if there are no associated local logs
         if (recording == null)
             return super.getLogs();
 
